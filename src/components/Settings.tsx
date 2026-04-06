@@ -12,10 +12,10 @@ interface AppConfig {
 }
 
 interface SettingsProps {
-  onConfigChange?: (config: AppConfig) => void;
+  // Config is now managed internally
 }
 
-export default function Settings({ onConfigChange }: SettingsProps) {
+export default function Settings({}: SettingsProps) {
   const [config, setConfig] = useState<AppConfig>({
     auto_optimize: false,
     auto_optimize_interval: 30,

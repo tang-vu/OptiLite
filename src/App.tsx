@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/tauri';
 import Dashboard from './components/Dashboard';
 import OptimizationPanel from './components/OptimizationPanel';
 import ProcessMonitor from './components/ProcessMonitor';
+import DiskOptimizer from './components/DiskOptimizer';
 import Settings from './components/Settings';
 import './styles/App.css';
 
@@ -30,7 +31,7 @@ interface ProcessInfo {
   is_chrome: boolean;
 }
 
-type TabType = 'dashboard' | 'optimize' | 'processes' | 'settings';
+type TabType = 'dashboard' | 'optimize' | 'processes' | 'disk' | 'settings';
 
 function App() {
   const [activeTab, setActiveTab] = useState<TabType>('dashboard');
@@ -38,8 +39,6 @@ function App() {
   const [processes, setProcesses] = useState<ProcessInfo[]>([]);
   const [isOptimizing, setIsOptimizing] = useState(false);
   const [optimizationLog, setOptimizationLog] = useState<string[]>([]);
-  const [autoOptimize, setAutoOptimize] = useState(false);
-  const [autoOptimizeInterval, setAutoOptimizeInterval] = useState(30);
 
   const fetchSystemStats = useCallback(async () => {
     try {
@@ -75,10 +74,10 @@ function App() {
   const handleOptimizeRAM = async () => {
     setIsOptimizing(true);
     try {
-      const result: any = await invoke('optimize_ram');
+      const result: any = await invoke('optimize_ram_true');
       const mbFreed = (result.freed_memory / 1_000_000).toFixed(0);
       setOptimizationLog(prev => [
-        `[${new Date().toLocaleTimeString()}] ✅ RAM Optimization: Freed ${mbFreed} MB`,
+        `[${new Date().toLocaleTimeString()}] ✅ TRUE RAM Optimization: Freed ${mbFreed} MB`,
         ...prev,
       ]);
       fetchSystemStats(); // Refresh stats immediately
@@ -202,6 +201,13 @@ function App() {
           Optimize
         </button>
         <button
+          className={`tab-button ${activeTab === 'disk' ? 'active' : ''}`}
+          onClick={() => setActiveTab('disk')}
+        >
+          <span className="tab-icon">💾</span>
+          Disks
+        </button>
+        <button
           className={`tab-button ${activeTab === 'processes' ? 'active' : ''}`}
           onClick={() => setActiveTab('processes')}
         >
@@ -239,17 +245,16 @@ function App() {
           />
         )}
 
+        {activeTab === 'disk' && (
+          <DiskOptimizer />
+        )}
+
         {activeTab === 'processes' && (
           <ProcessMonitor processes={processes} />
         )}
 
         {activeTab === 'settings' && (
-          <Settings
-            autoOptimize={autoOptimize}
-            onAutoOptimizeChange={setAutoOptimize}
-            autoOptimizeInterval={autoOptimizeInterval}
-            onAutoOptimizeIntervalChange={setAutoOptimizeInterval}
-          />
+          <Settings />
         )}
       </main>
 
