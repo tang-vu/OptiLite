@@ -188,9 +188,14 @@ export default function Dashboard({
             <div className="stat-label">GPU</div>
             <div className="stat-value">
               {systemStats.gpu_usage > 0
-                ? `${systemStats.gpu_usage.toFixed(1)}%`
-                : 'Monitoring'}
+                ? `${systemStats.gpu_usage.toFixed(1)}% | ${formatBytes(systemStats.gpu_memory_used)}`
+                : 'Monitoring...'}
             </div>
+            {systemStats.gpu_memory_total > 0 && (
+              <div className="stat-detail">
+                {formatBytes(systemStats.gpu_memory_used)} / {formatBytes(systemStats.gpu_memory_total)}
+              </div>
+            )}
           </div>
         </div>
 
@@ -201,8 +206,13 @@ export default function Dashboard({
             <div className="stat-value">
               {systemStats.temperature > 0
                 ? `${systemStats.temperature.toFixed(1)}°C`
-                : 'N/A'}
+                : 'Reading sensors...'}
             </div>
+            {systemStats.temperature > 0 && (
+              <div className="stat-detail">
+                {systemStats.temperature > 80 ? '⚠️ Hot!' : systemStats.temperature > 60 ? '🟡 Warm' : '🟢 Cool'}
+              </div>
+            )}
           </div>
         </div>
 

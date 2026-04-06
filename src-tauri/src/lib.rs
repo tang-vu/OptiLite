@@ -144,6 +144,116 @@ fn get_system_memory_info() -> (u64, u64) {
     (0, 0)
 }
 
+// Get GPU usage from Performance Counters (Windows)
+#[cfg(target_os = "windows")]
+fn get_gpu_info() -> (f32, u64, u64) {
+    // Try NVIDIA first using nvidia-smi
+    if let Ok(output) = Command::new("nvidia-smi")
+        .args(&["--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
+        .output() 
+    {
+        let result = String::from_utf8_lossy(&output.stdout);
+        if !result.trim().is_empty() {
+            let parts: Vec<&str> = result.trim().split(',').collect();
+            if parts.len() >= 3 {
+                let gpu_usage: f32 = parts[0].trim().parse().unwrap_or(0.0);
+                let mem_used: u64 = parts[1].trim().parse::<u64>().unwrap_or(0) * 1024 * 1024; // Convert MB to bytes
+                let mem_total: u64 = parts[2].trim().parse::<u64>().unwrap_or(0) * 1024 * 1024;
+                return (gpu_usage, mem_used, mem_total);
+            }
+        }
+    }
+
+    // Try AMD using PowerShell
+    if let Ok(output) = Command::new("powershell")
+        .args(&[
+            "-Command",
+            r#"(Get-Counter '\GPU Engine(*engtype_3D)\Utilization Percentage').CounterSamples | Measure-Object -Property CookedValue -Average | Select-Object -ExpandProperty Average"#
+        ])
+        .output()
+    {
+        let result = String::from_utf8_lossy(&output.stdout);
+        if let Ok(gpu_usage) = result.trim().parse::<f32>() {
+            // GPU memory not easily available via PowerShell, estimate based on usage
+            let estimated_mem = (gpu_usage / 100.0 * 4.0 * 1024.0 * 1024.0 * 1024.0) as u64; // Assume 4GB GPU
+            return (gpu_usage, estimated_mem, 4 * 1024 * 1024 * 1024);
+        }
+    }
+
+    // Fallback: try WMI for GPU info
+    if let Ok(output) = Command::new("powershell")
+        .args(&[
+            "-Command",
+            r#"Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty AdapterRAM"#
+        ])
+        .output()
+    {
+        let result = String::from_utf8_lossy(&output.stdout);
+        if let Ok(mem_total) = result.trim().parse::<u64>() {
+            if mem_total > 0 {
+                return (0.0, 0, mem_total); // Return GPU memory size at least
+            }
+        }
+    }
+
+    (0.0, 0, 0)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_gpu_info() -> (f32, u64, u64) {
+    (0.0, 0, 0)
+}
+
+// Get temperature from ACPI/WMI (Windows)
+#[cfg(target_os = "windows")]
+fn get_temperature() -> f32 {
+    // Method 1: Try WMI ACPI thermal zone
+    if let Ok(output) = Command::new("powershell")
+        .args(&[
+            "-Command",
+            r#"try { (Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace "root/wmi").CurrentTemperature } catch { }"#
+        ])
+        .output()
+    {
+        let result = String::from_utf8_lossy(&output.stdout);
+        if let Ok(temp_tenths_kelvin) = result.trim().parse::<f64>() {
+            if temp_tenths_kelvin > 0.0 {
+                // Convert from tenths of Kelvin to Celsius
+                let temp_celsius = (temp_tenths_kelvin / 10.0) - 273.15;
+                if temp_celsius > 0.0 && temp_celsius < 150.0 {
+                    return temp_celsius as f32;
+                }
+            }
+        }
+    }
+
+    // Method 2: Try reading from LibreHardwareMonitor if available
+    // (Would require external tool, skip for now)
+
+    // Method 3: Try motherboard sensors via PowerShell
+    if let Ok(output) = Command::new("powershell")
+        .args(&[
+            "-Command",
+            r#"try { Get-WmiObject -Namespace "root\OpenHardwareMonitor" -Query "SELECT Value FROM Sensor WHERE SensorType='Temperature' and Name='CPU Package'" | Select-Object -ExpandProperty Value } catch { }"#
+        ])
+        .output()
+    {
+        let result = String::from_utf8_lossy(&output.stdout);
+        if let Ok(temp) = result.trim().parse::<f32>() {
+            if temp > 0.0 && temp < 150.0 {
+                return temp;
+            }
+        }
+    }
+
+    0.0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_temperature() -> f32 {
+    0.0
+}
+
 // Initialize system state
 fn create_system_state() -> SystemState {
     let mut sys = System::new_all();
@@ -171,10 +281,13 @@ fn get_system_stats(state: tauri::State<SystemState>) -> Result<SystemStats, Str
     
     // Count Chrome processes
     let process_count = sys.processes().len();
-    
-    // Get temperature (placeholder - requires additional setup)
-    let temperature = 0.0;
-    
+
+    // Get GPU info
+    let (gpu_usage, gpu_memory_used, gpu_memory_total) = get_gpu_info();
+
+    // Get temperature
+    let temperature = get_temperature();
+
     Ok(SystemStats {
         ram_used,
         ram_total,
@@ -184,9 +297,9 @@ fn get_system_stats(state: tauri::State<SystemState>) -> Result<SystemStats, Str
         cpu_usage,
         cpu_count: sys.cpus().len(),
         process_count,
-        gpu_usage: 0.0, // Will be enhanced with GPU-specific libs
-        gpu_memory_used: 0,
-        gpu_memory_total: 0,
+        gpu_usage,
+        gpu_memory_used,
+        gpu_memory_total,
         uptime: sys.uptime(),
         temperature,
     })

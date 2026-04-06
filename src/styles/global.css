@@ -322,6 +322,12 @@ body {
   color: var(--text-primary);
 }
 
+.stat-detail {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: 0.25rem;
+}
+
 /* Circular Progress */
 .circular-progress {
   position: relative;
