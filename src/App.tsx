@@ -76,10 +76,12 @@ function App() {
     setIsOptimizing(true);
     try {
       const result: any = await invoke('optimize_ram');
+      const mbFreed = (result.freed_memory / 1_000_000).toFixed(0);
       setOptimizationLog(prev => [
-        `[${new Date().toLocaleTimeString()}] RAM Optimization: ${result.message}`,
+        `[${new Date().toLocaleTimeString()}] ✅ RAM Optimization: Freed ${mbFreed} MB`,
         ...prev,
       ]);
+      fetchSystemStats(); // Refresh stats immediately
     } catch (error) {
       console.error('RAM optimization failed:', error);
     } finally {
@@ -91,10 +93,12 @@ function App() {
     setIsOptimizing(true);
     try {
       const result: any = await invoke('optimize_chrome');
+      const mbFreed = (result.memory_freed / 1_000_000).toFixed(0);
       setOptimizationLog(prev => [
-        `[${new Date().toLocaleTimeString()}] Chrome Optimization: ${result.message}`,
+        `[${new Date().toLocaleTimeString()}] 🌐 Chrome Optimization: Freed ${mbFreed} MB (${result.tabs_optimized} tabs)`,
         ...prev,
       ]);
+      fetchSystemStats(); // Refresh stats immediately
     } catch (error) {
       console.error('Chrome optimization failed:', error);
     } finally {
@@ -121,10 +125,12 @@ function App() {
     setIsOptimizing(true);
     try {
       const result: any = await invoke('full_optimize');
+      const mbFreed = (result.freed_memory / 1_000_000).toFixed(0);
       setOptimizationLog(prev => [
-        `[${new Date().toLocaleTimeString()}] Full Optimization: ${result.message}`,
+        `[${new Date().toLocaleTimeString()}] 🚀 FULL Optimization: Freed ${mbFreed} MB RAM!`,
         ...prev,
       ]);
+      fetchSystemStats(); // Refresh stats immediately
     } catch (error) {
       console.error('Full optimization failed:', error);
     } finally {

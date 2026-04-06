@@ -15,11 +15,7 @@ tauri = { version = "1.5", features = ["shell-open", "fs-all", "os-all", "path-a
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.29"
-windows = { version = "0.52", features = [
-    "Win32_System_ProcessStatus",
-    "Win32_Foundation",
-    "Win32_System_Threading",
-] }
+winapi = { version = "0.3", features = ["psapi", "processthreadsapi", "handleapi", "winbase"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
