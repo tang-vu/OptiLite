@@ -7,6 +7,8 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    host: 'localhost',
+    cors: true,
   },
   envPrefix: ['VITE_', 'TAURI_'],
 });
