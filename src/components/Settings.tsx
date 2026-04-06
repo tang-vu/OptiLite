@@ -1,21 +1,77 @@
-interface SettingsProps {
-  autoOptimize: boolean;
-  onAutoOptimizeChange: (value: boolean) => void;
-  autoOptimizeInterval: number;
-  onAutoOptimizeIntervalChange: (value: number) => void;
+import { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/tauri';
+
+interface AppConfig {
+  auto_optimize: boolean;
+  auto_optimize_interval: number;
+  optimize_ram: boolean;
+  optimize_chrome: boolean;
+  optimize_cpu: boolean;
+  clean_temp: boolean;
+  flush_dns: boolean;
 }
 
-export default function Settings({
-  autoOptimize,
-  onAutoOptimizeChange,
-  autoOptimizeInterval,
-  onAutoOptimizeIntervalChange,
-}: SettingsProps) {
+interface SettingsProps {
+  onConfigChange?: (config: AppConfig) => void;
+}
+
+export default function Settings({ onConfigChange }: SettingsProps) {
+  const [config, setConfig] = useState<AppConfig>({
+    auto_optimize: false,
+    auto_optimize_interval: 30,
+    optimize_ram: true,
+    optimize_chrome: true,
+    optimize_cpu: true,
+    clean_temp: false,
+    flush_dns: false,
+  });
+  const [saved, setSaved] = useState(false);
+
+  // Load config on mount
+  useEffect(() => {
+    loadConfig();
+  }, []);
+
+  const loadConfig = async () => {
+    try {
+      const loadedConfig = await invoke<AppConfig>('get_config');
+      setConfig(loadedConfig);
+    } catch (error) {
+      console.error('Failed to load config:', error);
+    }
+  };
+
+  const saveConfig = async (newConfig: AppConfig) => {
+    try {
+      await invoke('save_config_command', { config: newConfig });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+      
+      // If auto-optimize enabled, restart it
+      if (newConfig.auto_optimize) {
+        await invoke('start_auto_optimize_command');
+      } else {
+        await invoke('stop_auto_optimize_command');
+      }
+    } catch (error) {
+      console.error('Failed to save config:', error);
+    }
+  };
+
+  const updateConfig = (updates: Partial<AppConfig>) => {
+    const newConfig = { ...config, ...updates };
+    setConfig(newConfig);
+    saveConfig(newConfig);
+  };
+
   return (
     <div className="settings-panel">
       <div className="settings-header">
         <h2>⚙️ Settings</h2>
         <p>Configure optimization preferences</p>
+        {saved && (
+          <div className="save-notification">✅ Saved!</div>
+        )}
       </div>
 
       <div className="settings-grid">
@@ -30,22 +86,22 @@ export default function Settings({
             <label className="toggle-switch">
               <input
                 type="checkbox"
-                checked={autoOptimize}
-                onChange={(e) => onAutoOptimizeChange(e.target.checked)}
+                checked={config.auto_optimize}
+                onChange={(e) => updateConfig({ auto_optimize: e.target.checked })}
               />
               <span className="toggle-slider"></span>
             </label>
           </div>
 
-          {autoOptimize && (
+          {config.auto_optimize && (
             <div className="setting-item">
               <div className="setting-info">
                 <label>Interval (minutes)</label>
                 <p>How often to run automatic optimization</p>
               </div>
               <select
-                value={autoOptimizeInterval}
-                onChange={(e) => onAutoOptimizeIntervalChange(Number(e.target.value))}
+                value={config.auto_optimize_interval}
+                onChange={(e) => updateConfig({ auto_optimize_interval: Number(e.target.value) })}
               >
                 <option value={5}>5 minutes</option>
                 <option value={10}>10 minutes</option>
@@ -66,7 +122,11 @@ export default function Settings({
               <label>RAM Optimization</label>
               <p>Clean unused memory from background processes</p>
             </div>
-            <input type="checkbox" defaultChecked />
+            <input 
+              type="checkbox" 
+              checked={config.optimize_ram}
+              onChange={(e) => updateConfig({ optimize_ram: e.target.checked })}
+            />
           </div>
 
           <div className="setting-item checkbox-item">
@@ -74,15 +134,23 @@ export default function Settings({
               <label>Chrome Optimization</label>
               <p>Reduce memory usage of Chrome tabs</p>
             </div>
-            <input type="checkbox" defaultChecked />
+            <input 
+              type="checkbox" 
+              checked={config.optimize_chrome}
+              onChange={(e) => updateConfig({ optimize_chrome: e.target.checked })}
+            />
           </div>
 
           <div className="setting-item checkbox-item">
             <div className="setting-info">
               <label>CPU Optimization</label>
-              <p>Optimize high-CPU processes</p>
+              <p>Lower priority of high-CPU processes</p>
             </div>
-            <input type="checkbox" defaultChecked />
+            <input 
+              type="checkbox" 
+              checked={config.optimize_cpu}
+              onChange={(e) => updateConfig({ optimize_cpu: e.target.checked })}
+            />
           </div>
 
           <div className="setting-item checkbox-item">
@@ -90,7 +158,11 @@ export default function Settings({
               <label>Temp File Cleaning</label>
               <p>Clean temporary files automatically</p>
             </div>
-            <input type="checkbox" />
+            <input 
+              type="checkbox" 
+              checked={config.clean_temp}
+              onChange={(e) => updateConfig({ clean_temp: e.target.checked })}
+            />
           </div>
 
           <div className="setting-item checkbox-item">
@@ -98,7 +170,11 @@ export default function Settings({
               <label>DNS Flushing</label>
               <p>Clear DNS cache periodically</p>
             </div>
-            <input type="checkbox" />
+            <input 
+              type="checkbox" 
+              checked={config.flush_dns}
+              onChange={(e) => updateConfig({ flush_dns: e.target.checked })}
+            />
           </div>
         </div>
 

@@ -753,6 +753,7 @@ body {
 
 .settings-header {
   margin-bottom: 2rem;
+  position: relative;
 }
 
 .settings-header h2 {
@@ -762,6 +763,26 @@ body {
 
 .settings-header p {
   color: var(--text-secondary);
+}
+
+.save-notification {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background: var(--success);
+  color: white;
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius);
+  font-size: 0.875rem;
+  font-weight: 600;
+  animation: fadeInOut 2s ease-in-out;
+}
+
+@keyframes fadeInOut {
+  0% { opacity: 0; transform: translateY(-10px); }
+  20% { opacity: 1; transform: translateY(0); }
+  80% { opacity: 1; transform: translateY(0); }
+  100% { opacity: 0; transform: translateY(-10px); }
 }
 
 .settings-grid {

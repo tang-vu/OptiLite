@@ -7,22 +7,58 @@ use serde::{Deserialize, Serialize};
 use sysinfo::{System, ProcessExt, SystemExt, CpuExt, PidExt};
 use std::sync::Mutex;
 use std::process::Command;
+use std::fs;
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+use tauri::Manager;
 
 #[cfg(target_os = "windows")]
 use winapi::{
     shared::minwindef::DWORD,
     um::{
-        processthreadsapi::{OpenProcess},
+        processthreadsapi::OpenProcess,
         psapi::{EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         handleapi::CloseHandle,
-        winbase::SetProcessWorkingSetSize,
+        winbase::{SetProcessWorkingSetSize, SetProcessAffinityMask},
         winnt::PROCESS_ALL_ACCESS,
     },
 };
 
+// Priority class constants
+const BELOW_NORMAL_PRIORITY_CLASS: DWORD = 0x00004000;
+const ABOVE_NORMAL_PRIORITY_CLASS: DWORD = 0x00008000;
+const REALTIME_PRIORITY_CLASS: DWORD = 0x00000100;
+
 // System state shared across commands
 struct SystemState {
     sys: Mutex<System>,
+    config: Mutex<AppConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AppConfig {
+    pub auto_optimize: bool,
+    pub auto_optimize_interval: u64, // minutes
+    pub optimize_ram: bool,
+    pub optimize_chrome: bool,
+    pub optimize_cpu: bool,
+    pub clean_temp: bool,
+    pub flush_dns: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            auto_optimize: false,
+            auto_optimize_interval: 30,
+            optimize_ram: true,
+            optimize_chrome: true,
+            optimize_cpu: true,
+            clean_temp: false,
+            flush_dns: false,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -75,10 +111,9 @@ pub struct ChromeOptimizationResult {
 #[cfg(target_os = "windows")]
 fn trim_process_memory(pid: u32) -> Result<u64, String> {
     unsafe {
-        // Open process with ALL_ACCESS rights
         let h_process = OpenProcess(
             PROCESS_ALL_ACCESS,
-            0, // inherit handle
+            0,
             pid as DWORD,
         );
 
@@ -86,20 +121,14 @@ fn trim_process_memory(pid: u32) -> Result<u64, String> {
             return Err(format!("Failed to open process {}", pid));
         }
 
-        // Get memory info before
         let mut pmc_before: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
         pmc_before.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as DWORD;
         GetProcessMemoryInfo(h_process, &mut pmc_before, std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as DWORD);
         let memory_before = pmc_before.WorkingSetSize as u64;
 
-        // Method 1: EmptyWorkingSet - aggressive trim
         EmptyWorkingSet(h_process);
-
-        // Method 2: SetWorkingSetSize - force minimum
-        // Set to (-1, -1) which tells Windows to trim aggressively
         SetProcessWorkingSetSize(h_process, !0usize, !0usize);
 
-        // Get memory info after
         let mut pmc_after: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
         pmc_after.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as DWORD;
         GetProcessMemoryInfo(h_process, &mut pmc_after, std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as DWORD);
@@ -115,6 +144,56 @@ fn trim_process_memory(pid: u32) -> Result<u64, String> {
 #[cfg(not(target_os = "windows"))]
 fn trim_process_memory(_pid: u32) -> Result<u64, String> {
     Err("Memory trimming not supported on this platform".to_string())
+}
+
+// Set process priority (Windows)
+#[cfg(target_os = "windows")]
+fn set_process_priority(pid: u32, priority: DWORD) -> Result<String, String> {
+    unsafe {
+        let h_process = OpenProcess(PROCESS_ALL_ACCESS, 0, pid as DWORD);
+        if h_process.is_null() {
+            return Err(format!("Failed to open process {}", pid));
+        }
+
+        // Set priority class
+        if winapi::um::processthreadsapi::SetPriorityClass(h_process, priority) == 0 {
+            CloseHandle(h_process);
+            return Err(format!("Failed to set priority for process {}", pid));
+        }
+
+        CloseHandle(h_process);
+        Ok(format!("Set process {} to priority {}", pid, priority))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_process_priority(_pid: u32, _priority: u32) -> Result<String, String> {
+    Err("Process priority not supported on this platform".to_string())
+}
+
+// Set process CPU affinity (limit which cores it can use)
+#[cfg(target_os = "windows")]
+fn set_process_affinity(pid: u32, affinity_mask: DWORD) -> Result<String, String> {
+    unsafe {
+        let h_process = OpenProcess(PROCESS_ALL_ACCESS, 0, pid as DWORD);
+        if h_process.is_null() {
+            return Err(format!("Failed to open process {}", pid));
+        }
+
+        // Set process affinity mask
+        if SetProcessAffinityMask(h_process, affinity_mask) == 0 {
+            CloseHandle(h_process);
+            return Err(format!("Failed to set affinity for process {}", pid));
+        }
+
+        CloseHandle(h_process);
+        Ok(format!("Set process {} affinity to {}", pid, affinity_mask))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_process_affinity(_pid: u32, _affinity_mask: usize) -> Result<String, String> {
+    Err("Process affinity not supported on this platform".to_string())
 }
 
 // Get system-wide memory before optimization
@@ -157,7 +236,7 @@ fn get_gpu_info() -> (f32, u64, u64) {
             let parts: Vec<&str> = result.trim().split(',').collect();
             if parts.len() >= 3 {
                 let gpu_usage: f32 = parts[0].trim().parse().unwrap_or(0.0);
-                let mem_used: u64 = parts[1].trim().parse::<u64>().unwrap_or(0) * 1024 * 1024; // Convert MB to bytes
+                let mem_used: u64 = parts[1].trim().parse::<u64>().unwrap_or(0) * 1024 * 1024;
                 let mem_total: u64 = parts[2].trim().parse::<u64>().unwrap_or(0) * 1024 * 1024;
                 return (gpu_usage, mem_used, mem_total);
             }
@@ -174,8 +253,7 @@ fn get_gpu_info() -> (f32, u64, u64) {
     {
         let result = String::from_utf8_lossy(&output.stdout);
         if let Ok(gpu_usage) = result.trim().parse::<f32>() {
-            // GPU memory not easily available via PowerShell, estimate based on usage
-            let estimated_mem = (gpu_usage / 100.0 * 4.0 * 1024.0 * 1024.0 * 1024.0) as u64; // Assume 4GB GPU
+            let estimated_mem = (gpu_usage / 100.0 * 4.0 * 1024.0 * 1024.0 * 1024.0) as u64;
             return (gpu_usage, estimated_mem, 4 * 1024 * 1024 * 1024);
         }
     }
@@ -191,7 +269,7 @@ fn get_gpu_info() -> (f32, u64, u64) {
         let result = String::from_utf8_lossy(&output.stdout);
         if let Ok(mem_total) = result.trim().parse::<u64>() {
             if mem_total > 0 {
-                return (0.0, 0, mem_total); // Return GPU memory size at least
+                return (0.0, 0, mem_total);
             }
         }
     }
@@ -218,7 +296,6 @@ fn get_temperature() -> f32 {
         let result = String::from_utf8_lossy(&output.stdout);
         if let Ok(temp_tenths_kelvin) = result.trim().parse::<f64>() {
             if temp_tenths_kelvin > 0.0 {
-                // Convert from tenths of Kelvin to Celsius
                 let temp_celsius = (temp_tenths_kelvin / 10.0) - 273.15;
                 if temp_celsius > 0.0 && temp_celsius < 150.0 {
                     return temp_celsius as f32;
@@ -227,10 +304,7 @@ fn get_temperature() -> f32 {
         }
     }
 
-    // Method 2: Try reading from LibreHardwareMonitor if available
-    // (Would require external tool, skip for now)
-
-    // Method 3: Try motherboard sensors via PowerShell
+    // Method 2: Try OpenHardwareMonitor
     if let Ok(output) = Command::new("powershell")
         .args(&[
             "-Command",
@@ -254,12 +328,348 @@ fn get_temperature() -> f32 {
     0.0
 }
 
+// Config file management
+fn get_config_path() -> Result<PathBuf, String> {
+    let proj_dirs = directories::ProjectDirs::from("com", "optilite", "OptiLite")
+        .ok_or("Failed to get config directory".to_string())?;
+    let config_dir = proj_dirs.config_dir();
+    fs::create_dir_all(config_dir).map_err(|e| format!("Failed to create config dir: {}", e))?;
+    Ok(config_dir.join("config.json"))
+}
+
+fn load_config() -> AppConfig {
+    let config_path = match get_config_path() {
+        Ok(path) => path,
+        Err(_) => return AppConfig::default(),
+    };
+
+    if config_path.exists() {
+        let config_str = fs::read_to_string(&config_path).unwrap_or_default();
+        serde_json::from_str(&config_str).unwrap_or_default()
+    } else {
+        AppConfig::default()
+    }
+}
+
+fn save_config(config: &AppConfig) -> Result<(), String> {
+    let config_path = get_config_path()?;
+    let config_str = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+    fs::write(&config_path, config_str)
+        .map_err(|e| format!("Failed to write config: {}", e))?;
+    Ok(())
+}
+
+// Start auto-optimization background thread
+fn start_auto_optimize(app_handle: tauri::AppHandle, config: AppConfig) {
+    let interval = config.auto_optimize_interval;
+    if interval == 0 || !config.auto_optimize {
+        return;
+    }
+
+    thread::spawn(move || {
+        loop {
+            // Sleep for interval minutes
+            thread::sleep(Duration::from_secs(interval * 60));
+
+            // Run optimization based on config
+            let mut results = Vec::new();
+
+            if config.optimize_ram {
+                match optimize_ram_internal() {
+                    Ok(result) => results.push(format!("RAM: {}", result.message)),
+                    Err(e) => results.push(format!("RAM Error: {}", e)),
+                }
+            }
+
+            if config.optimize_chrome {
+                match optimize_chrome_internal() {
+                    Ok(result) => results.push(format!("Chrome: {}", result.message)),
+                    Err(e) => results.push(format!("Chrome Error: {}", e)),
+                }
+            }
+
+            if config.optimize_cpu {
+                match optimize_cpu_internal() {
+                    Ok(result) => results.push(format!("CPU: {}", result.message)),
+                    Err(e) => results.push(format!("CPU Error: {}", e)),
+                }
+            }
+
+            if config.clean_temp {
+                let _ = clean_temp_files_internal();
+            }
+
+            if config.flush_dns {
+                let _ = flush_dns_internal();
+            }
+
+            // Emit event to frontend
+            if !results.is_empty() {
+                let message = format!("[Auto-Optimize] {}", results.join(" | "));
+                let _ = app_handle.emit_all("auto-optimize-result", &message);
+            }
+        }
+    });
+}
+
+// Internal optimization functions (without tauri command wrapper)
+fn optimize_ram_internal() -> Result<OptimizationResult, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let (mem_before, _) = get_system_memory_info();
+        
+        let mut optimized_processes = Vec::new();
+        let mut total_freed: u64 = 0;
+        
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        
+        let target_names = ["chrome", "msedge", "firefox", "code", "discord", "slack", "teams"];
+        
+        for (pid, process) in sys.processes() {
+            let name = process.name().to_lowercase();
+            let pid_u32 = pid.as_u32();
+            
+            let is_target = target_names.iter().any(|t| name.contains(t));
+            if !is_target || process.memory() < 100_000_000 {
+                continue;
+            }
+            
+            match trim_process_memory(pid_u32) {
+                Ok(freed) => {
+                    if freed > 0 {
+                        total_freed += freed;
+                        optimized_processes.push(process.name().to_string());
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        
+        let (mem_after, _) = get_system_memory_info();
+        
+        Ok(OptimizationResult {
+            success: true,
+            freed_memory: total_freed,
+            memory_before: mem_before,
+            memory_after: mem_after,
+            optimized_processes: optimized_processes.clone(),
+            message: format!("Freed {} MB RAM from {} processes", 
+                total_freed / 1_000_000,
+                optimized_processes.len()),
+        })
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(OptimizationResult {
+            success: true,
+            freed_memory: 0,
+            memory_before: 0,
+            memory_after: 0,
+            optimized_processes: vec![],
+            message: "RAM optimization completed (non-Windows)".to_string(),
+        })
+    }
+}
+
+fn optimize_chrome_internal() -> Result<ChromeOptimizationResult, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let (mem_before, _) = get_system_memory_info();
+        
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        
+        let mut chrome_pids = Vec::new();
+        
+        for (pid, process) in sys.processes() {
+            if process.name().to_lowercase().contains("chrome") {
+                chrome_pids.push((pid.as_u32(), process.memory()));
+            }
+        }
+        
+        if chrome_pids.is_empty() {
+            return Ok(ChromeOptimizationResult {
+                success: true,
+                tabs_optimized: 0,
+                memory_before: 0,
+                memory_after: 0,
+                memory_freed: 0,
+                message: "No Chrome processes found".to_string(),
+            });
+        }
+        
+        let chrome_count = chrome_pids.len() as u32;
+        let mut total_freed: u64 = 0;
+        
+        for (pid, _) in &chrome_pids {
+            match trim_process_memory(*pid) {
+                Ok(freed) => total_freed += freed,
+                Err(_) => continue,
+            }
+        }
+        
+        let (mem_after, _) = get_system_memory_info();
+        let estimated_tabs = chrome_count.saturating_sub(2);
+        
+        Ok(ChromeOptimizationResult {
+            success: true,
+            tabs_optimized: estimated_tabs,
+            memory_before: mem_before,
+            memory_after: mem_after,
+            memory_freed: total_freed,
+            message: format!("Optimized {} Chrome processes, freed {} MB RAM", 
+                chrome_count, 
+                total_freed / 1_000_000),
+        })
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(ChromeOptimizationResult {
+            success: true,
+            tabs_optimized: 0,
+            memory_before: 0,
+            memory_after: 0,
+            memory_freed: 0,
+            message: "Chrome optimization completed (non-Windows)".to_string(),
+        })
+    }
+}
+
+fn optimize_cpu_internal() -> Result<OptimizationResult, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        
+        let mut optimized = Vec::new();
+        let mut processes_lowered = 0;
+        
+        // Find processes using high CPU and lower their priority
+        for (pid, process) in sys.processes() {
+            let cpu = process.cpu_usage();
+            let name = process.name().to_lowercase();
+            
+            // Skip critical system processes
+            if name.contains("system") || name.contains("csrss") || name.contains("svchost") {
+                continue;
+            }
+            
+            if cpu > 50.0 {
+                // Lower priority to below normal
+                match set_process_priority(pid.as_u32(), BELOW_NORMAL_PRIORITY_CLASS) {
+                    Ok(_) => {
+                        optimized.push(format!("{} ({}%)", process.name(), cpu));
+                        processes_lowered += 1;
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+        
+        Ok(OptimizationResult {
+            success: true,
+            freed_memory: 0,
+            memory_before: 0,
+            memory_after: 0,
+            optimized_processes: optimized.clone(),
+            message: format!("Lowered priority of {} high-CPU processes", processes_lowered),
+        })
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(OptimizationResult {
+            success: true,
+            freed_memory: 0,
+            memory_before: 0,
+            memory_after: 0,
+            optimized_processes: vec![],
+            message: "CPU optimization completed (non-Windows)".to_string(),
+        })
+    }
+}
+
+fn clean_temp_files_internal() -> Result<OptimizationResult, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("powershell")
+            .args(&[
+                "-Command",
+                "Remove-Item -Path \"$env:TEMP\\*\" -Recurse -Force -ErrorAction SilentlyContinue"
+            ])
+            .output();
+        
+        match output {
+            Ok(_) => Ok(OptimizationResult {
+                success: true,
+                freed_memory: 0,
+                memory_before: 0,
+                memory_after: 0,
+                optimized_processes: vec![],
+                message: "Temporary files cleaned".to_string(),
+            }),
+            Err(e) => Err(format!("Failed to clean temp files: {}", e)),
+        }
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(OptimizationResult {
+            success: true,
+            freed_memory: 0,
+            memory_before: 0,
+            memory_after: 0,
+            optimized_processes: vec![],
+            message: "Temp files cleaned (non-Windows)".to_string(),
+        })
+    }
+}
+
+fn flush_dns_internal() -> Result<OptimizationResult, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("ipconfig")
+            .args(&["/flushdns"])
+            .output();
+        
+        match output {
+            Ok(_) => Ok(OptimizationResult {
+                success: true,
+                freed_memory: 0,
+                memory_before: 0,
+                memory_after: 0,
+                optimized_processes: vec![],
+                message: "DNS cache flushed".to_string(),
+            }),
+            Err(e) => Err(format!("Failed to flush DNS: {}", e)),
+        }
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(OptimizationResult {
+            success: true,
+            freed_memory: 0,
+            memory_before: 0,
+            memory_after: 0,
+            optimized_processes: vec![],
+            message: "DNS flushed (non-Windows)".to_string(),
+        })
+    }
+}
+
 // Initialize system state
 fn create_system_state() -> SystemState {
     let mut sys = System::new_all();
     sys.refresh_all();
+    let config = load_config();
     SystemState {
         sys: Mutex::new(sys),
+        config: Mutex::new(config),
     }
 }
 
@@ -278,16 +688,10 @@ fn get_system_stats(state: tauri::State<SystemState>) -> Result<SystemStats, Str
     };
     
     let cpu_usage = sys.global_cpu_info().cpu_usage();
-    
-    // Count Chrome processes
     let process_count = sys.processes().len();
-
-    // Get GPU info
     let (gpu_usage, gpu_memory_used, gpu_memory_total) = get_gpu_info();
-
-    // Get temperature
     let temperature = get_temperature();
-
+    
     Ok(SystemStats {
         ram_used,
         ram_total,
@@ -330,213 +734,127 @@ fn get_processes(state: tauri::State<SystemState>) -> Result<Vec<ProcessInfo>, S
     Ok(processes)
 }
 
-// Optimize RAM - Windows-specific memory cleanup with real API calls
+// Get current config
 #[tauri::command]
-fn optimize_ram() -> Result<OptimizationResult, String> {
-    #[cfg(target_os = "windows")]
-    {
-        let (mem_before, _) = get_system_memory_info();
-        
-        let mut optimized_processes = Vec::new();
-        let mut total_freed: u64 = 0;
-        
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        
-        // Target Chrome, Edge, and other memory-heavy processes
-        let target_names = ["chrome", "msedge", "firefox", "code", "discord", "slack", "teams"];
-        
-        for (pid, process) in sys.processes() {
-            let name = process.name().to_lowercase();
-            let pid_u32 = pid.as_u32();
-            
-            // Skip if not a target
-            let is_target = target_names.iter().any(|t| name.contains(t));
-            if !is_target {
-                continue;
-            }
-            
-            // Only optimize processes using > 100MB
-            if process.memory() < 100_000_000 {
-                continue;
-            }
-            
-            // Try to trim memory
-            match trim_process_memory(pid_u32) {
-                Ok(freed) => {
-                    if freed > 0 {
-                        total_freed += freed;
-                        optimized_processes.push(process.name().to_string());
-                    }
-                }
-                Err(_) => {
-                    // Some processes can't be opened (system processes, elevated)
-                    continue;
-                }
-            }
-        }
-        
-        let (mem_after, _) = get_system_memory_info();
-        
-        Ok(OptimizationResult {
-            success: true,
-            freed_memory: total_freed,
-            memory_before: mem_before,
-            memory_after: mem_after,
-            optimized_processes: optimized_processes.clone(),
-            message: format!("Freed {} MB RAM from {} processes", 
-                total_freed / 1_000_000,
-                optimized_processes.len()),
-        })
-    }
-    
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(OptimizationResult {
+fn get_config(state: tauri::State<SystemState>) -> Result<AppConfig, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    Ok(config.clone())
+}
+
+// Save config
+#[tauri::command]
+fn save_config_command(state: tauri::State<SystemState>, config: AppConfig) -> Result<String, String> {
+    let mut state_config = state.config.lock().map_err(|e| e.to_string())?;
+    *state_config = config.clone();
+    save_config(&config)?;
+    Ok("Config saved successfully".to_string())
+}
+
+// Start auto-optimization
+#[tauri::command]
+fn start_auto_optimize_command(state: tauri::State<SystemState>, app_handle: tauri::AppHandle) -> Result<String, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?.clone();
+    start_auto_optimize(app_handle, config.clone());
+    Ok(format!("Auto-optimization started (interval: {} minutes)", config.auto_optimize_interval))
+}
+
+// Stop auto-optimization (by setting interval to 0)
+#[tauri::command]
+fn stop_auto_optimize_command(state: tauri::State<SystemState>) -> Result<String, String> {
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    config.auto_optimize = false;
+    save_config(&config)?;
+    Ok("Auto-optimization stopped".to_string())
+}
+
+// Optimize RAM
+#[tauri::command]
+fn optimize_ram(state: tauri::State<SystemState>) -> Result<OptimizationResult, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    if !config.optimize_ram {
+        return Ok(OptimizationResult {
             success: true,
             freed_memory: 0,
             memory_before: 0,
             memory_after: 0,
             optimized_processes: vec![],
-            message: "RAM optimization completed (non-Windows)".to_string(),
-        })
+            message: "RAM optimization disabled".to_string(),
+        });
     }
+    drop(config);
+    optimize_ram_internal()
 }
 
-// Chrome-specific optimization with real memory trimming
+// Optimize Chrome
 #[tauri::command]
-fn optimize_chrome() -> Result<ChromeOptimizationResult, String> {
-    #[cfg(target_os = "windows")]
-    {
-        let (mem_before, _) = get_system_memory_info();
-        
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        
-        let mut chrome_pids = Vec::new();
-        
-        // Find all Chrome processes
-        for (pid, process) in sys.processes() {
-            if process.name().to_lowercase().contains("chrome") {
-                chrome_pids.push((pid.as_u32(), process.memory()));
-            }
-        }
-        
-        if chrome_pids.is_empty() {
-            return Ok(ChromeOptimizationResult {
-                success: true,
-                tabs_optimized: 0,
-                memory_before: 0,
-                memory_after: 0,
-                memory_freed: 0,
-                message: "No Chrome processes found".to_string(),
-            });
-        }
-        
-        let chrome_count = chrome_pids.len() as u32;
-        let mut total_freed: u64 = 0;
-        
-        // Trim each Chrome process
-        for (pid, _) in &chrome_pids {
-            match trim_process_memory(*pid) {
-                Ok(freed) => {
-                    total_freed += freed;
-                }
-                Err(_) => continue,
-            }
-        }
-        
-        let (mem_after, _) = get_system_memory_info();
-        
-        // Estimate tabs from process count
-        let estimated_tabs = chrome_count.saturating_sub(2);
-        
-        Ok(ChromeOptimizationResult {
-            success: true,
-            tabs_optimized: estimated_tabs,
-            memory_before: mem_before,
-            memory_after: mem_after,
-            memory_freed: total_freed,
-            message: format!("Optimized {} Chrome processes, freed {} MB RAM", 
-                chrome_count, 
-                total_freed / 1_000_000),
-        })
-    }
-    
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(ChromeOptimizationResult {
+fn optimize_chrome(state: tauri::State<SystemState>) -> Result<ChromeOptimizationResult, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    if !config.optimize_chrome {
+        return Ok(ChromeOptimizationResult {
             success: true,
             tabs_optimized: 0,
             memory_before: 0,
             memory_after: 0,
             memory_freed: 0,
-            message: "Chrome optimization completed (non-Windows)".to_string(),
-        })
+            message: "Chrome optimization disabled".to_string(),
+        });
     }
+    drop(config);
+    optimize_chrome_internal()
 }
 
-// CPU optimization - monitor and report
+// Optimize CPU
 #[tauri::command]
-fn optimize_cpu() -> Result<OptimizationResult, String> {
-    #[cfg(target_os = "windows")]
-    {
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        
-        let mut optimized = Vec::new();
-        
-        // Find processes using high CPU
-        for (_pid, process) in sys.processes() {
-            if process.cpu_usage() > 50.0 {
-                optimized.push(process.name().to_string());
-            }
-        }
-        
-        Ok(OptimizationResult {
-            success: true,
-            freed_memory: 0,
-            memory_before: 0,
-            memory_after: 0,
-            optimized_processes: optimized.clone(),
-            message: format!("Monitored {} high-CPU processes", optimized.len()),
-        })
-    }
-    
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(OptimizationResult {
+fn optimize_cpu(state: tauri::State<SystemState>) -> Result<OptimizationResult, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    if !config.optimize_cpu {
+        return Ok(OptimizationResult {
             success: true,
             freed_memory: 0,
             memory_before: 0,
             memory_after: 0,
             optimized_processes: vec![],
-            message: "CPU optimization completed (non-Windows)".to_string(),
-        })
+            message: "CPU optimization disabled".to_string(),
+        });
     }
+    drop(config);
+    optimize_cpu_internal()
 }
 
 // Full system optimization
 #[tauri::command]
-fn full_optimize() -> Result<OptimizationResult, String> {
+fn full_optimize(state: tauri::State<SystemState>) -> Result<OptimizationResult, String> {
     #[cfg(target_os = "windows")]
     {
+        let config = state.config.lock().map_err(|e| e.to_string())?.clone();
         let (mem_before, _) = get_system_memory_info();
         
         let mut total_freed: u64 = 0;
         let mut all_processes = Vec::new();
         
-        // Optimize Chrome first (biggest impact)
-        let chrome_result = optimize_chrome()?;
-        total_freed += chrome_result.memory_freed;
+        if config.optimize_chrome {
+            let chrome_result = optimize_chrome_internal()?;
+            total_freed += chrome_result.memory_freed;
+        }
         
-        // Then general RAM optimization
-        let ram_result = optimize_ram()?;
-        total_freed += ram_result.freed_memory;
-        all_processes.extend(ram_result.optimized_processes);
+        if config.optimize_ram {
+            let ram_result = optimize_ram_internal()?;
+            total_freed += ram_result.freed_memory;
+            all_processes.extend(ram_result.optimized_processes);
+        }
         
-        // Clean temp files
-        let _ = clean_temp_files();
+        if config.optimize_cpu {
+            let cpu_result = optimize_cpu_internal()?;
+            all_processes.extend(cpu_result.optimized_processes);
+        }
+        
+        if config.clean_temp {
+            let _ = clean_temp_files_internal();
+        }
+        
+        if config.flush_dns {
+            let _ = flush_dns_internal();
+        }
         
         let (mem_after, _) = get_system_memory_info();
         
@@ -567,84 +885,31 @@ fn full_optimize() -> Result<OptimizationResult, String> {
 // Clean temporary files
 #[tauri::command]
 fn clean_temp_files() -> Result<OptimizationResult, String> {
-    #[cfg(target_os = "windows")]
-    {
-        let output = Command::new("powershell")
-            .args(&[
-                "-Command",
-                "Remove-Item -Path \"$env:TEMP\\*\" -Recurse -Force -ErrorAction SilentlyContinue"
-            ])
-            .output();
-        
-        match output {
-            Ok(_) => Ok(OptimizationResult {
-                success: true,
-                freed_memory: 0,
-                memory_before: 0,
-                memory_after: 0,
-                optimized_processes: vec![],
-                message: "Temporary files cleaned".to_string(),
-            }),
-            Err(e) => Err(format!("Failed to clean temp files: {}", e)),
-        }
-    }
-    
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(OptimizationResult {
-            success: true,
-            freed_memory: 0,
-            memory_before: 0,
-            memory_after: 0,
-            optimized_processes: vec![],
-            message: "Temp files cleaned (non-Windows)".to_string(),
-        })
-    }
+    clean_temp_files_internal()
 }
 
 // Flush DNS cache
 #[tauri::command]
 fn flush_dns() -> Result<OptimizationResult, String> {
-    #[cfg(target_os = "windows")]
-    {
-        let output = Command::new("ipconfig")
-            .args(&["/flushdns"])
-            .output();
-        
-        match output {
-            Ok(_) => Ok(OptimizationResult {
-                success: true,
-                freed_memory: 0,
-                memory_before: 0,
-                memory_after: 0,
-                optimized_processes: vec![],
-                message: "DNS cache flushed".to_string(),
-            }),
-            Err(e) => Err(format!("Failed to flush DNS: {}", e)),
-        }
-    }
-    
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(OptimizationResult {
-            success: true,
-            freed_memory: 0,
-            memory_before: 0,
-            memory_after: 0,
-            optimized_processes: vec![],
-            message: "DNS flushed (non-Windows)".to_string(),
-        })
-    }
+    flush_dns_internal()
 }
 
 pub fn run() {
     let system_state = create_system_state();
+    
+    // Check if auto-optimize should start
+    let config = system_state.config.lock().unwrap().clone();
+    let should_auto_start = config.auto_optimize;
     
     tauri::Builder::default()
         .manage(system_state)
         .invoke_handler(tauri::generate_handler![
             get_system_stats,
             get_processes,
+            get_config,
+            save_config_command,
+            start_auto_optimize_command,
+            stop_auto_optimize_command,
             optimize_ram,
             optimize_chrome,
             optimize_cpu,
@@ -652,6 +917,12 @@ pub fn run() {
             clean_temp_files,
             flush_dns,
         ])
+        .setup(move |app| {
+            if should_auto_start {
+                start_auto_optimize(app.handle(), config);
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
